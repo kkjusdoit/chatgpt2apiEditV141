@@ -35,3 +35,5 @@ git_cache/
 loginwithpassword_*/
 logwithemailverifycode_*/
 test_batch_output/
+*.before-*
+*.bak

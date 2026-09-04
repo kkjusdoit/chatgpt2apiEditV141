@@ -22,7 +22,9 @@ from services.openai_backend_api import (
 from utils.helper import (
     IMAGE_MODELS,
     extract_image_from_message_content,
+    image_upstream_model,
     is_codex_image_model,
+    is_gptfree_model,
     is_supported_image_model,
     split_image_model,
 )
@@ -317,6 +319,7 @@ class ConversationRequest:
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
     cancel_event: Any = None  # threading.Event-like object used by background image tasks
+    source_type: str | None = None
 
 
 @dataclass
@@ -443,15 +446,36 @@ def sanitize_output_text(text: str) -> str:
     return text
 
 
+
+def is_visible_assistant_message(message: dict[str, Any]) -> bool:
+    """Return whether an upstream assistant message is intended for the user."""
+    author = message.get("author")
+    if not isinstance(author, dict):
+        return False
+    role = str(author.get("role") or "").strip().lower()
+    if role != "assistant":
+        return False
+
+    metadata = message.get("metadata") or {}
+    if isinstance(metadata, dict) and metadata.get("is_visually_hidden_from_conversation") is True:
+        return False
+
+    recipient = str(message.get("recipient") or "").strip().lower()
+    if recipient and recipient != "all":
+        return False
+
+    channel = str(message.get("channel") or "").strip().lower()
+    if channel and channel != "final":
+        return False
+
+    return True
+
 def assistant_raw_text(event: dict[str, Any], current_text: str = "", history_text: str = "") -> str:
     for candidate in (event, event.get("v")):
         if not isinstance(candidate, dict):
             continue
         message = candidate.get("message")
-        if not isinstance(message, dict):
-            continue
-        role = str((message.get("author") or {}).get("role") or "").strip().lower()
-        if role != "assistant":
+        if not isinstance(message, dict) or not is_visible_assistant_message(message):
             continue
         text = assistant_message_text(message)
         if text:
@@ -468,7 +492,7 @@ def event_assistant_text(event: dict[str, Any], history_text: str = "") -> str:
         if not isinstance(candidate, dict):
             continue
         message = candidate.get("message")
-        if isinstance(message, dict) and (message.get("author") or {}).get("role") == "assistant":
+        if isinstance(message, dict) and is_visible_assistant_message(message):
             return strip_history(assistant_message_text(message), history_text)
     return ""
 
@@ -685,8 +709,8 @@ def conversation_events(
     yield from iter_conversation_payloads(payloads, history_text, history_messages)
 
 
-def text_backend() -> OpenAIBackendAPI:
-    return OpenAIBackendAPI(access_token=account_service.get_text_access_token())
+def text_backend(source_type: str = "default") -> OpenAIBackendAPI:
+    return OpenAIBackendAPI(access_token=account_service.get_text_access_token(source_type=source_type))
 
 
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
@@ -724,7 +748,10 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                     token = refreshed_token
                 else:
                     account_service.remove_invalid_token(token, "text_stream")
-                    token = account_service.get_text_access_token(attempted_tokens)
+                    token = account_service.get_text_access_token(
+                        attempted_tokens,
+                        source_type=request.source_type or "default",
+                    )
                 if token:
                     continue
             raise
@@ -786,6 +813,31 @@ def _get_detailed_error_from_tasks(
         return ""
 
 
+def _remove_image_conversation_later(
+        backend: OpenAIBackendAPI,
+        conversation_id: str,
+        *,
+        success: bool,
+) -> None:
+    if not conversation_id:
+        return
+    if not (config.image_remove_conversation_always or (success and config.image_remove_conversation_after_result)):
+        return
+
+    def _run() -> None:
+        try:
+            backend.delete_conversation(conversation_id)
+            logger.info({"event": "image_conversation_removed", "conversation_id": conversation_id})
+        except Exception as exc:
+            logger.warning({
+                "event": "image_conversation_remove_failed",
+                "conversation_id": conversation_id,
+                "error": str(exc),
+            })
+
+    threading.Thread(target=_run, name=f"remove-image-conversation-{conversation_id}", daemon=True).start()
+
+
 def stream_image_outputs(
         backend: OpenAIBackendAPI,
         request: ConversationRequest,
@@ -810,6 +862,7 @@ def stream_image_outputs(
                 total=total,
                 text=str(event.get("delta") or ""),
                 upstream_event_type="conversation.delta",
+                conversation_id=str(event.get("conversation_id") or ""),
             )
             continue
         if event.get("type") == "conversation.event":
@@ -821,6 +874,7 @@ def stream_image_outputs(
                 index=index,
                 total=total,
                 upstream_event_type=raw_type,
+                conversation_id=str(event.get("conversation_id") or ""),
             )
 
     conversation_id = str(last.get("conversation_id") or "")
@@ -1276,9 +1330,12 @@ def _generate_single_image(
                 request.progress_callback("getting_account")
             plan_type, _ = split_image_model(request.model)
             codex_model = is_codex_image_model(request.model)
+            source_type = request.source_type or (
+                "gptfree" if is_gptfree_model(request.model) else ("codex" if codex_model else "default")
+            )
             token = account_service.get_available_access_token(
                 plan_type=plan_type,
-                source_type="codex" if codex_model else None,
+                source_type=source_type,
                 plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
                 excluded_tokens=attempted_tokens,
             )
@@ -1324,7 +1381,11 @@ def _generate_single_image(
             if request.progress_callback:
                 request.progress_callback(event)
 
-        attempt_request = replace(request, progress_callback=progress_callback)
+        attempt_request = replace(
+            request,
+            model=image_upstream_model(request.model),
+            progress_callback=progress_callback,
+        )
 
         def mark_result(success: bool, error: object = "") -> None:
             nonlocal slot_held
@@ -1336,22 +1397,31 @@ def _generate_single_image(
             backend.progress_callback = progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
             outputs: list[ImageOutput] = []
-            for output in stream_fn(backend, attempt_request, index, total):
-                if account_email and not output.account_email:
-                    output.account_email = account_email
-                if output.kind == "message" and request.message_as_error:
-                    raise ImageGenerationError(
-                        output.text or "Image generation was rejected by upstream policy.",
-                        status_code=400,
-                        error_type="invalid_request_error",
-                        code="content_policy_violation",
-                        account_email=account_email,
-                        conversation_id=output.conversation_id,
-                    )
-                emitted_for_token = True
-                returned_message = output.kind == "message"
-                returned_result = returned_result or output.kind == "result"
-                outputs.append(output)
+            last_conversation_id = ""
+            try:
+                for output in stream_fn(backend, attempt_request, index, total):
+                    last_conversation_id = output.conversation_id or last_conversation_id
+                    output.model = request.model
+                    if account_email and not output.account_email:
+                        output.account_email = account_email
+                    if output.kind == "message" and request.message_as_error:
+                        raise ImageGenerationError(
+                            output.text or "Image generation was rejected by upstream policy.",
+                            status_code=400,
+                            error_type="invalid_request_error",
+                            code="content_policy_violation",
+                            account_email=account_email,
+                            conversation_id=output.conversation_id,
+                        )
+                    emitted_for_token = True
+                    returned_message = output.kind == "message"
+                    returned_result = returned_result or output.kind == "result"
+                    outputs.append(output)
+            except Exception as exc:
+                last_conversation_id = last_conversation_id or str(getattr(exc, "conversation_id", "") or "")
+                raise
+            finally:
+                _remove_image_conversation_later(backend, last_conversation_id, success=returned_result)
             if returned_message:
                 mark_result(False, "upstream returned text instead of generating an image")
                 return outputs

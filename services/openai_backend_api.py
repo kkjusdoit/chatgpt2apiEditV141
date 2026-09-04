@@ -32,12 +32,25 @@ class InvalidAccessTokenError(RuntimeError):
     pass
 
 
-class ImagePollTimeoutError(RuntimeError):
+class ImageTaskError(RuntimeError):
+    """图片生成异常基类，携带上游会话 ID 供调用方清理对话。"""
+
+    def __init__(self, message: str = "", conversation_id: str = "") -> None:
+        super().__init__(message)
+        self.conversation_id = conversation_id
+
+
+class ImagePollTimeoutError(ImageTaskError):
     pass
 
 
-class ImageContentPolicyError(RuntimeError):
+class ImageContentPolicyError(ImageTaskError):
     """Raised when image generation is blocked by content policy moderation."""
+    pass
+
+
+class ImageStreamHardTimeoutError(RuntimeError):
+    """图片 SSE 流读取超过硬上限时抛出，用于快速中断被挂起的长连接。"""
     pass
 
 
@@ -279,6 +292,16 @@ class OpenAIBackendAPI:
         headers["X-OpenAI-Target-Route"] = path
         if extra:
             headers.update(extra)
+        # FlareSolverr clearance cookies are bound to the browser User-Agent
+        # that obtained them. Build from an empty mapping so the cached bundle
+        # can supply both values, then let them override the account fingerprint
+        # for this upstream request.
+        clearance_headers = proxy_settings.build_headers(
+            target_url=self.base_url + path,
+            account=self.account,
+            upstream=True,
+        )
+        headers.update({str(key): str(value) for key, value in clearance_headers.items()})
         return headers
 
     @staticmethod
@@ -2268,7 +2291,7 @@ class OpenAIBackendAPI:
                         "attempt": attempt,
                         "error_msg": policy_msg[:200],
                     })
-                    raise ImageContentPolicyError(policy_msg)
+                    raise ImageContentPolicyError(policy_msg, conversation_id or "")
 
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
@@ -2314,7 +2337,8 @@ class OpenAIBackendAPI:
         exc = ImagePollTimeoutError(
             f"ChatGPT 生图超时（已等待 {timeout_secs} 秒）。"
             f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
-            f"也可能是账号被限流或生图队列拥堵导致。"
+            f"也可能是账号被限流或生图队列拥堵导致。",
+            conversation_id or "",
         )
         if last_task_error:
             setattr(exc, "task_error", last_task_error)
@@ -2528,7 +2552,7 @@ class OpenAIBackendAPI:
                 task_error = getattr(exc, "task_error", "")
                 if not file_ids and not sediment_ids:
                     if task_error:
-                        raise ImageContentPolicyError(task_error) from exc
+                        raise ImageContentPolicyError(task_error, conversation_id or "") from exc
                     raise
                 logger.warning({
                     "event": "image_resolve_poll_partial_timeout",
@@ -2619,10 +2643,51 @@ class OpenAIBackendAPI:
         self._report_progress("starting_generation")
         response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
         self._report_progress("generating")
+        yield from self._iter_sse_payloads_capped(response, float(config.image_poll_timeout_secs))
+
+    def _iter_sse_payloads_capped(self, response: Any, hard_cap_secs: float) -> Iterator[str]:
+        """按墙钟硬上限消费图片 SSE 流，避免上游异常时长连接被无限挂起。"""
+        deadline = time.monotonic() + hard_cap_secs
+        watchdog = threading.Timer(hard_cap_secs, response.close)
+        watchdog.daemon = True
+        watchdog.start()
+        timeout_message = f"图片生成流已超过硬上限 {int(hard_cap_secs)} 秒，已强制中断（上游可能未生成图片）"
         try:
-            yield from iter_sse_payloads(response)
+            for payload in iter_sse_payloads(response):
+                yield payload
+                if time.monotonic() >= deadline:
+                    raise ImageStreamHardTimeoutError(timeout_message)
+        except ImageStreamHardTimeoutError:
+            raise
+        except Exception as exc:
+            if time.monotonic() >= deadline:
+                raise ImageStreamHardTimeoutError(timeout_message) from exc
+            raise
         finally:
-            response.close()
+            watchdog.cancel()
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    def delete_conversation(self, conversation_id: str) -> Dict[str, Any]:
+        """删除本地对话记录。"""
+        path = f"/backend-api/conversation/{conversation_id}"
+        headers = self._headers(path, {
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "Referer": f"{self.base_url}/c/{conversation_id}",
+            "X-OpenAI-Target-Route": "/backend-api/conversation/{conversation_id}",
+        })
+        response = self.session.patch(
+            self.base_url + path,
+            headers=headers,
+            json={"is_visible": False},
+            timeout=60,
+        )
+        if response.status_code != 200:
+            self._raise_on_error(response, path)
+        return response.json()
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""

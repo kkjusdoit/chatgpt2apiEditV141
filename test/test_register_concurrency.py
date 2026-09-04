@@ -68,7 +68,7 @@ class RegisterConcurrencyTests(unittest.TestCase):
         self.assertNotIn("max_wait", provider)
         self.assertNotIn("create_total_budget", provider)
 
-    def test_normalize_enables_cloudflare_manual_level_suffix_by_default(self) -> None:
+    def test_normalize_leaves_cloudflare_optional_subdomain_defaults_implicit(self) -> None:
         config = register_service_module._normalize(
             {
                 "mail": {
@@ -84,11 +84,38 @@ class RegisterConcurrencyTests(unittest.TestCase):
         )
 
         provider = config["mail"]["providers"][0]
-        self.assertIs(provider["append_random_suffix"], True)
+        self.assertEqual(provider["subdomain_levels"], ["sfsfe", "grtwrwe"])
+        self.assertNotIn("append_random_suffix", provider)
+        self.assertNotIn("random_subdomain_depth", provider)
 
         config["mail"]["providers"][0]["append_random_suffix"] = False
         normalized = register_service_module._normalize(config)
         self.assertIs(normalized["mail"]["providers"][0]["append_random_suffix"], False)
+
+    def test_normalize_keeps_base_domain_worker_config_free_of_subdomain_options(self) -> None:
+        config = register_service_module._normalize(
+            {
+                "mail": {
+                    "providers": [
+                        {
+                            "type": "cloudflare_temp_email",
+                            "enable": True,
+                            "api_base": "https://emailbot.example.workers.dev",
+                            "admin_password": "secret",
+                            "domain": ["mail.example.com"],
+                            "subdomain": ["mail.example.com"],
+                        }
+                    ]
+                }
+            }
+        )
+
+        provider = config["mail"]["providers"][0]
+        self.assertEqual(provider["domain"], ["mail.example.com"])
+        self.assertEqual(provider["subdomain"], ["mail.example.com"])
+        self.assertNotIn("append_random_suffix", provider)
+        self.assertNotIn("random_subdomain_depth", provider)
+        self.assertNotIn("subdomain_levels", provider)
 
     def test_normalize_clears_stale_runtime_state_when_disabled(self) -> None:
         config = register_service_module._normalize(
@@ -265,6 +292,31 @@ class RegisterConcurrencyTests(unittest.TestCase):
             self.assertEqual(stats["success"], 1)
             self.assertEqual(stats["fail"], 2)
             self.assertEqual(stats["done"], 3)
+
+    def test_available_mode_stops_when_target_is_already_reached(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = register_service_module.RegisterService(Path(temp_dir) / "register.json")
+            metrics = {"current_quota": 375, "current_available": 15}
+
+            with mock.patch.object(service, "_pool_metrics", return_value=metrics), mock.patch.object(
+                register_service_module.openai_register,
+                "worker",
+            ) as worker:
+                service.start(
+                    {
+                        "threads": 2,
+                        "mode": "available",
+                        "target_available": 15,
+                        "check_interval": 1,
+                    }
+                )
+                self.assertTrue(self.wait_until(lambda: not service.get()["enabled"], timeout=2))
+
+            worker.assert_not_called()
+            stats = service.get()["stats"]
+            self.assertEqual(stats["current_available"], 15)
+            self.assertEqual(stats["running"], 0)
+            self.assertIsNotNone(stats.get("finished_at"))
 
     def test_verification_failure_continues_without_global_cooldown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -593,6 +593,8 @@ class ConfigStore:
         data["image_redundant_max_attempts"] = self.image_redundant_max_attempts
         data["image_parallel_generation"] = self.image_parallel_generation
         data["image_chat_panel_enabled"] = self.image_chat_panel_enabled
+        data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result
+        data["image_remove_conversation_always"] = self.image_remove_conversation_always
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
         data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh

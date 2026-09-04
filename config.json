@@ -1,12 +1,12 @@
 {
-  "auth-key": "change-me",
+  "auth-key": "d39f4f608e530a8b2040497a63d93fe8f6611cf30f957959",
   "refresh_account_interval_minute": 5,
   "image_retention_days": 15,
   "image_poll_timeout_secs": 100,
   "image_default_model_slug": "gpt-5-5-thinking",
   "image_fallback_model_slug": "gpt-5-3",
   "auto_remove_rate_limited_accounts": false,
-  "auto_remove_invalid_accounts": true,
+  "auto_remove_invalid_accounts": false,
   "log_levels": [
     "debug",
     "error",
@@ -15,9 +15,9 @@
   ],
   "proxy": "",
   "proxy_runtime": {
-    "enabled": false,
+    "enabled": true,
     "egress_mode": "single_proxy",
-    "proxy_url": "",
+    "proxy_url": "http://privoxy:8118",
     "resource_proxy_url": "",
     "skip_ssl_verify": false,
     "reset_session_status_codes": [
@@ -30,9 +30,9 @@
       "cf_clearance": "",
       "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
       "browser": "chrome",
-      "flaresolverr_url": "",
+      "flaresolverr_url": "http://flaresolverr:8191",
       "timeout_sec": 60,
-      "refresh_interval": 3600,
+      "refresh_interval": 600,
       "warm_up_on_start": true
     }
   },

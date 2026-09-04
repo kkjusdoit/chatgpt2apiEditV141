@@ -11,12 +11,13 @@ from pathlib import Path
 
 from services.account_service import account_service
 from services.config import DATA_DIR
-from services.register import mail_provider, openai_register, reference_register
+from services.register import gptfree_register, mail_provider, openai_register, reference_register
 from utils.resource_limits import fd_pressure, is_resource_exhaustion_error, process_fd_snapshot
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
 NEW_REGISTER_FILE = DATA_DIR / "new_register.json"
+GPTFREE_REGISTER_FILE = DATA_DIR / "gptfree_register.json"
 
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
     return "\n".join(
@@ -119,18 +120,28 @@ def _normalize(raw: dict) -> dict:
                         provider.pop(key, None)
                 elif provider.get("type") == "cloudflare_temp_email":
                     provider.pop("rate_limit_cooldown_seconds", None)
-                    provider["append_random_suffix"] = _safe_bool(provider.get("append_random_suffix"), True)
-                    levels = provider.get("subdomain_levels")
-                    if isinstance(levels, list):
-                        provider["subdomain_levels"] = [str(value).strip() for value in levels if str(value).strip()]
-                    else:
-                        value = str(levels or "").strip()
-                        provider["subdomain_levels"] = [value] if value else []
-                    try:
-                        depth = int(provider.get("random_subdomain_depth") or 1)
-                    except (TypeError, ValueError):
-                        depth = 1
-                    provider["random_subdomain_depth"] = max(1, min(5, depth))
+                    provider["fixed_address"] = str(provider.get("fixed_address") or "").strip()
+                    # These fields are optional provider features. Preserve and
+                    # normalize them when explicitly configured, but do not
+                    # materialize defaults into register.json. The provider
+                    # already applies the same defaults at runtime, while a
+                    # base-domain-only Workers setup must stay free of custom
+                    # subdomain settings when it is saved again.
+                    if "append_random_suffix" in provider:
+                        provider["append_random_suffix"] = _safe_bool(provider.get("append_random_suffix"), True)
+                    if "subdomain_levels" in provider:
+                        levels = provider.get("subdomain_levels")
+                        if isinstance(levels, list):
+                            provider["subdomain_levels"] = [str(value).strip() for value in levels if str(value).strip()]
+                        else:
+                            value = str(levels or "").strip()
+                            provider["subdomain_levels"] = [value] if value else []
+                    if "random_subdomain_depth" in provider:
+                        try:
+                            depth = int(provider.get("random_subdomain_depth") or 1)
+                        except (TypeError, ValueError):
+                            depth = 1
+                        provider["random_subdomain_depth"] = max(1, min(5, depth))
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
@@ -545,13 +556,10 @@ class RegisterService:
                         if stop_event.wait(wait_seconds):
                             break
                         continue
-                    if str(cfg.get("mode") or "total") == "total" and self._target_reached(
-                        cfg,
-                        success,
-                        0,
-                        generation,
-                        stop_event,
-                    ):
+                    # All modes should finish once their target is reached.
+                    # Previously only total mode exited here, leaving quota and
+                    # available jobs enabled forever with zero running workers.
+                    if self._target_reached(cfg, success, 0, generation, stop_event):
                         break
                     if stop_event.wait(max(1, int(cfg.get("check_interval") or 5))):
                         break
@@ -661,3 +669,4 @@ class RegisterService:
 
 register_service = RegisterService(REGISTER_FILE)
 new_register_service = RegisterService(NEW_REGISTER_FILE, engine=reference_register)
+gptfree_register_service = RegisterService(GPTFREE_REGISTER_FILE, engine=gptfree_register)

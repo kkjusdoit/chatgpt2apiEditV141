@@ -8,6 +8,7 @@ from fastapi import HTTPException, Request
 from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config
+from services.proxy_service import proxy_settings
 from utils.resource_limits import fd_pressure, process_fd_snapshot
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -120,6 +121,29 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
             stop_event.wait(interval_seconds)
 
     thread = Thread(target=worker, name="account-watcher", daemon=True)
+    thread.start()
+    return thread
+
+
+def start_proxy_clearance_warmup(stop_event: Event, retry_interval_seconds: float = 10) -> Thread | None:
+    runtime = config.get_proxy_runtime_settings()
+    clearance = runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {}
+    if not runtime.get("enabled") or not clearance.get("enabled") or not clearance.get("warm_up_on_start"):
+        return None
+
+    def worker() -> None:
+        while not stop_event.is_set():
+            try:
+                bundle = proxy_settings.refresh_clearance(force=True, upstream=True)
+                if bundle is not None:
+                    print("[proxy-clearance-warmup] ready")
+                    return
+                print("[proxy-clearance-warmup] no clearance bundle; retrying")
+            except Exception as exc:
+                print(f"[proxy-clearance-warmup] failed: {exc}; retrying")
+            stop_event.wait(max(0.1, retry_interval_seconds))
+
+    thread = Thread(target=worker, name="proxy-clearance-warmup", daemon=True)
     thread.start()
     return thread
 

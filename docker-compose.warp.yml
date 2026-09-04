@@ -49,7 +49,7 @@ services:
       start_period: 30s
 
   privoxy:
-    image: vimagick/privoxy:latest
+    image: local/privoxy:arm64
     container_name: chatgpt2api-privoxy
     restart: unless-stopped
     depends_on:
@@ -97,9 +97,9 @@ services:
       init-config:
         condition: service_completed_successfully
       privoxy:
-        condition: service_started
+        condition: service_healthy
       flaresolverr:
-        condition: service_started
+        condition: service_healthy
     ports:
       - "${CHATGPT2API_PORT:-3000}:80"
     volumes:

@@ -209,6 +209,8 @@ domain_index = 0
 provider_index = 0
 cloudmail_token_lock = Lock()
 cloudmail_token_cache: dict[str, tuple[str, float]] = {}
+fixed_mailbox_lock = Lock()
+fixed_mailbox_reservations: set[str] = set()
 provider_log_sink: Callable[[str], None] | None = None
 
 
@@ -283,6 +285,39 @@ def _normalize_dns_name(value: Any, field: str) -> str:
     ):
         raise RuntimeError(f"{field} 格式无效: {name}")
     return ascii_name
+
+
+def _normalize_full_email(value: Any, field: str) -> str:
+    candidate = str(value or "").strip()
+    local_part, separator, raw_domain = candidate.rpartition("@")
+    if not separator or not local_part or "@" in local_part:
+        raise RuntimeError(f"{field} 格式无效")
+    if (
+        len(local_part) > 64
+        or local_part.startswith(".")
+        or local_part.endswith(".")
+        or ".." in local_part
+        or not re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+", local_part)
+    ):
+        raise RuntimeError(f"{field} 格式无效")
+    domain = _normalize_dns_name(raw_domain, f"{field}域名")
+    return f"{local_part}@{domain}"
+
+
+def _reserve_fixed_mailbox(key: str) -> bool:
+    with fixed_mailbox_lock:
+        if key in fixed_mailbox_reservations:
+            return False
+        fixed_mailbox_reservations.add(key)
+        return True
+
+
+def _release_fixed_mailbox(mailbox: dict[str, Any]) -> None:
+    key = str(mailbox.pop("_fixed_mailbox_reservation", "") or "").strip()
+    if not key:
+        return
+    with fixed_mailbox_lock:
+        fixed_mailbox_reservations.discard(key)
 
 
 def _create_session(conf: dict):
@@ -547,6 +582,7 @@ class CloudflareTempMailProvider(BaseMailProvider):
         self.domain = _normalize_string_list(entry.get("domain"))
         self.subdomain = _normalize_string_list(entry.get("subdomain"))
         self.subdomain_levels = _normalize_string_list(entry.get("subdomain_levels"))
+        self.fixed_address = str(entry.get("fixed_address") or "").strip()
         suffix_value = entry.get("append_random_suffix", True)
         if isinstance(suffix_value, bool):
             self.append_random_suffix = suffix_value
@@ -598,6 +634,8 @@ class CloudflareTempMailProvider(BaseMailProvider):
         return f"{prefix}.{base_domain}"
 
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        if self.fixed_address:
+            return self._get_or_create_fixed_mailbox()
         selected_domain = self._resolve_domain()
         data = self._request(
             "POST",
@@ -620,9 +658,89 @@ class CloudflareTempMailProvider(BaseMailProvider):
             "token": token,
         }
 
+    def _get_or_create_fixed_mailbox(self) -> dict[str, Any]:
+        address = _normalize_full_email(self.fixed_address, "CloudflareTempMail 指定完整邮箱")
+        reservation_key = f"{self.api_base.lower()}|{address.lower()}"
+        if not _reserve_fixed_mailbox(reservation_key):
+            raise RuntimeError("CloudflareTempMail 指定完整邮箱正在被其他注册任务使用，请使用单线程测试")
+        try:
+            try:
+                mailbox = self.get_existing_mailbox(address)
+            except RuntimeError:
+                if self._last_status_code not in (400, 404):
+                    raise
+                local_part, _, domain = address.rpartition("@")
+                data = self._request(
+                    "POST",
+                    "/admin/new_address",
+                    headers={"x-admin-auth": self.admin_password},
+                    payload={
+                        "enablePrefix": False,
+                        "name": local_part,
+                        "domain": domain,
+                    },
+                )
+                returned_address = str(data.get("address") or "").strip()
+                token = str(data.get("jwt") or "").strip()
+                if returned_address.lower() != address.lower() or not token:
+                    raise RuntimeError("CloudflareTempMail 无法按指定完整邮箱精确创建地址")
+                mailbox = {
+                    "provider": self.name,
+                    "provider_ref": self.provider_ref,
+                    "address": returned_address,
+                    "token": token,
+                }
+            mailbox["_fixed_mailbox_reservation"] = reservation_key
+            mailbox["fixed_address"] = True
+            return mailbox
+        except Exception as exc:
+            if self._last_status_code == 400 and "address already exists" in str(exc).lower():
+                try:
+                    mailbox = self.get_existing_mailbox(address)
+                except Exception:
+                    mailbox = None
+                if mailbox is not None:
+                    mailbox["_fixed_mailbox_reservation"] = reservation_key
+                    mailbox["fixed_address"] = True
+                    return mailbox
+            with fixed_mailbox_lock:
+                fixed_mailbox_reservations.discard(reservation_key)
+            raise
+
     def get_existing_mailbox(self, email: str) -> dict[str, Any]:
         """通过管理员密码获取已有邮箱地址的 JWT，用于查询邮件。"""
-        data = self._request("POST", "/admin/get_address", headers={"x-admin-auth": self.admin_password}, payload={"address": email})
+        query_data = self._request(
+            "GET",
+            "/admin/address",
+            headers={"x-admin-auth": self.admin_password},
+            params={"limit": 100, "offset": 0, "query": email},
+        )
+        results = query_data.get("results")
+        if not isinstance(results, list):
+            raise RuntimeError("CloudflareTempMail address lookup returned an invalid response")
+        target = email.strip().lower()
+        matched = next(
+            (
+                item
+                for item in results
+                if isinstance(item, dict)
+                and str(item.get("name") or item.get("address") or "").strip().lower() == target
+            ),
+            None,
+        )
+        if matched is None:
+            # Preserve the existing create-on-404 branch without treating API errors as absence.
+            self._last_status_code = 404
+            raise RuntimeError("CloudflareTempMail fixed address was not found")
+        address_id = str(matched.get("id") or "").strip()
+        if not address_id:
+            raise RuntimeError("CloudflareTempMail existing address is missing its id")
+        token_data = self._request(
+            "GET",
+            f"/admin/show_password/{address_id}",
+            headers={"x-admin-auth": self.admin_password},
+        )
+        data = {"address": email, "jwt": token_data.get("jwt")}
         address = str(data.get("address") or "").strip()
         token = str(data.get("jwt") or "").strip()
         if not address or not token:
@@ -2246,6 +2364,7 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
     仅对 outlook_token 邮箱生效：成功标记 used；失败时若是 token 失效标记 token_invalid，
     其余失败标记 failed（保留邮箱占用以便排查，可通过重置释放）。
     """
+    _release_fixed_mailbox(mailbox)
     reason = str(error or "").strip()
     if not success and "等待注册验证码超时" in reason:
         _mark_tempmail_verification_timeout(mailbox)
@@ -2265,6 +2384,7 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
 
 def release_mailbox(mailbox: dict) -> None:
     """把 outlook_token 邮箱从 in_use 释放回未使用（用于流程主动放弃且未消费验证码时）。"""
+    _release_fixed_mailbox(mailbox)
     if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:
         return
     _release_outlook_token_state(str(mailbox.get("address") or ""))
